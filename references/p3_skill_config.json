@@ -1,0 +1,76 @@
+{
+  "skill_name": "排列3预测 V1.0.0",
+  "version": "1.4.0",
+  "release_date": "2026-06-25",
+  "author": "J.A.R.V.I.S.",
+  "description": "排列3（Pick3）多策略融合预测 - 位置采样+模式识别+博弈论+数学过滤",
+  "lottery_type": "排列3 (Pick3)",
+  "data_source": {
+    "relative_path": "assets/data/排列3历史数据.xlsx",
+    "column_format": "期号 / 百位 / 十位 / 个位"
+  },
+  "api_config": {
+    "gameNo": 35,
+    "api_url": "https://webapi.sporttery.cn/gateway/lottery/getHistoryPageListV1.qry",
+    "fallback": "500彩票网 datachart.500.com/pls"
+  },
+  "rules": {
+    "digit_range": [0, 9],
+    "digit_count": 3,
+    "bet_types": ["直选", "组三", "组六", "豹子"],
+    "zx_combinations": 1000,
+    "bet_types_desc": "直选(顺序全匹配,1000注), 组三(2同,理论90注组选=270注直选), 组六(3不同,理论120注组选=720注直选), 豹子(3同,10注)"
+  },
+  "sampler_config": {
+    "strategies": {
+      "hot": {"weight": 0.30, "strategy": "每位数近30期高频"},
+      "cold": {"weight": 0.15, "strategy": "每位数遗漏最大"},
+      "trend": {"weight": 0.20, "strategy": "近期趋势方向加权"},
+      "balance": {"weight": 0.20, "strategy": "热冷折中"}
+    },
+    "group_sampling": "组选频率分析：组三/组六独立采样"
+  },
+  "pattern_recognition": {
+    "features": [
+      {"name": "sum", "weight": 0.15, "desc": "百+十+个 和值 (0-27)"},
+      {"name": "span", "weight": 0.12, "desc": "最大位-最小位 (0-9)"},
+      {"name": "parity", "weight": 0.12, "desc": "奇偶比分布 (3:0/2:1/1:2/0:3)"},
+      {"name": "big_small", "weight": 0.10, "desc": "大小比分布 (≥5为大)"},
+      {"name": "repeat", "weight": 0.12, "desc": "与上期对应位置重复位数"},
+      {"name": "group_type", "weight": 0.12, "desc": "组三/组六/豹子形态"},
+      {"name": "prime_count", "weight": 0.08, "desc": "质数(2,3,5,7)个数"},
+      {"name": "route_012", "weight": 0.10, "desc": "各数字mod 3的分布"},
+      {"name": "consecutive", "weight": 0.09, "desc": "连号个数"}
+    ],
+    "integration": "模式池: 从高频模式反推号码; 评分增强: base + 模式匹配度×20%"
+  },
+  "scoring": {
+    "method": "full_enumeration_4layer",
+    "zx_enumeration": "10×10×10=1000",
+    "z3_enumeration": "90×3perms=270",
+    "z6_enumeration": "120×6perms=720",
+    "weights_zx": [0.45, 0.25, 0.20, 0.10],
+    "weights_z3": [0.35, 0.30, 0.25, 0.10],
+    "weights_z6": [0.40, 0.25, 0.25, 0.10],
+    "layer1": "position_freq*0.5 + trans*0.3 + poisson*0.2",
+    "layer2": "sum/span/repeat(0.7) + pattern_recognition(0.3)",
+    "layer3": "parity(0.5) + math_smart_score(0.5)",
+    "layer4": "game_theory_expected_value",
+    "normalization": "minmax_per_layer",
+    "repeat_injection": "fallback if top10 lacks repeat"
+  },
+  "constraint_engine": {
+    "hard_sum_range": [1, 26],
+    "hard_span_range": [0, 9],
+    "soft_sum_prefer": [8, 19],
+    "soft_span_prefer": [2, 8],
+    "parity_prefer": ["2:1", "1:2"]
+  },
+  "compound_betting": {
+    "direct_compound": "定位复式: 每位选多个数字",
+    "group_compound": "组选复式: 选N>3个数字的组合",
+    "note": "排列3直选复式为三位分别选号相乘; 组选复式从数字池中选3个"
+  },
+  "training_time_sec": "<10",
+  "prediction_time_sec": "<1"
+}

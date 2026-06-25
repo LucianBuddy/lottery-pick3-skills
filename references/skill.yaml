@@ -1,0 +1,108 @@
+# 排列3（Pick3）预测技能
+name: lottery-pick3-skills
+version: 1.0.0
+description: 中国体育彩票排列3（Pick3）预测技能，位置采样+模式识别+博弈论+数学过滤
+author: 贾维斯 (J.A.R.V.I.S.)
+license: MIT
+
+# 技能类型
+type: prediction
+category: lottery
+tags:
+  - lottery
+  - prediction
+  - pick3
+  - pls
+  - china-lottery
+
+# 运行时要求
+runtime:
+  python: ">=3.6"
+  dependencies:
+    - pandas>=1.0.0
+    - numpy>=1.18.0
+    - openpyxl>=3.0.0
+  optional_dependencies: []
+
+# 技能配置
+config:
+  data_file_path:
+    type: string
+    default: "assets/data/排列3历史数据.xlsx"
+    description: "排列3历史数据文件路径"
+  digit_range:
+    type: list
+    default: [0, 9]
+    description: "每位数字范围"
+  bet_types:
+    type: list
+    default: ["直选", "组三", "组六"]
+    description: "支持的投注类型"
+
+# 技能入口点
+entrypoint: p3_lottery_skill.py
+main_class: Pick3FusionComplete
+
+# 技能命令
+commands:
+  predict:
+    description: "预测下一期排列3号码（直选+组三+组六+复式）"
+    usage: "pick3 predict [--zx N] [--z3 N] [--z6 N] [--no-compound]"
+    options:
+      zx:
+        type: integer
+        default: 10
+        description: "直选推荐注数"
+      z3:
+        type: integer
+        default: 5
+        description: "组三推荐注数"
+      z6:
+        type: integer
+        default: 5
+        description: "组六推荐注数"
+      no-compound:
+        type: boolean
+        default: false
+        description: "跳过复式方案"
+  backtest:
+    description: "回测模型在N期间的表现"
+    usage: "pick3 backtest [--periods N]"
+    options:
+      periods:
+        type: integer
+        default: 50
+        description: "回测期数"
+  info:
+    description: "查看技能信息"
+    usage: "pick3 info"
+
+# 技能输出格式
+output:
+  predictions:
+    type: object
+    properties:
+      period:
+        type: string
+        description: "预测期号"
+      zx_bets:
+        type: array
+        description: "直选推荐方案 [百,十,个]"
+      z3_bets:
+        type: array
+        description: "组三推荐方案 (2个相同数字)"
+      z6_bets:
+        type: array
+        description: "组六推荐方案 (3个不同数字)"
+      compound_bets:
+        type: object
+        description: "复式方案(直选复式/组选复式)"
+
+# 技能元数据
+metadata:
+  created: "2026-06-24"
+  updated: "2026-06-24"
+  constraints:
+    - "数据文件需放在 skills/lottery-pick3-skills/assets/data/ 目录下"
+    - "彩票规则严格遵守：每位0-9，共3位"
+    - "直选=位置全匹配，组三=2同，组六=3不同"
