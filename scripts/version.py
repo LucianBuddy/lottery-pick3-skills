@@ -5,10 +5,16 @@
 所有其他模块通过 from version import VERSION, RELEASE_DATE 引用。
 """
 
-VERSION = "2.2.0"
-RELEASE_DATE = "2026-06-25"
+VERSION = "2.9.1"
+RELEASE_DATE = "2026-06-29"
 
 # 变更日志
+# 2.7.0 (2026-06-27)
+# - [P1] 延迟初始化ML/蒙特卡洛/RL退火(SIGKILL OOM修复)
+# - [P2] 8维Borda高相关子模型监控打印
+# - [P4] MC预计算共享(3个枚举方法复用同一结果)
+# - [P5] update_from_actual() IRL在线更新接口
+#
 # 1.8.0 (2026-06-25)
 # - [1] Borda去L1噪声, 代以纯转移秩+蒙特卡洛共识+涨落检测
 # - [2] 贝叶斯收缩替代拉普拉斯平滑(二阶/三阶转移矩阵)

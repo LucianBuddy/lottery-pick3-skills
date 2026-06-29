@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 排列3 (Pick3) 预测结果存储模块
-自动保存预测结果至知识库，保留最近十期。
+自动保存预测结果至知识库，保留最近两期。
 """
 
-MAX_PERIODS = 10
+MAX_PERIODS = 2
 
 import json
 import os

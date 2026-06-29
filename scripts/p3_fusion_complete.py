@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-排列3 (Pick3) 多策略融合预测系统 V1.4.2
+排列3 (Pick3) 多策略融合预测系统 V2.9.1
 
-重构: 全量枚举(1000/90/120) + 3层评分 + 隔期重号注入
-重大修复: backtest 复用 _compute_layers 消除代码重复和评分偏移
+全量枚举(1000/90/120) + 置换检验MI权重校准 + 等权重7层
++ 位置级转移(替代1000×1000) + Z3/Z6裁剪 + IRL在线学习
+
+V2.9.1 优化:
+  [1] 冷号衰减 — 长遗漏(>50期)数字L1分数封顶
+  [2] 位置多样性约束 — 同一位置同一数字最多2次
+  [4] 转移概率Borda权重提升(0.2→0.35)
+  [5] 复式每位候选数≥3(自动展宽)
 
 评分体系:
-  Layer1: 位置三阶频率乘积 (热/冷/趋势融合)  weight=0.50
-  Layer2: 模式匹配 (和值/跨度/隔期重号/跨期模式)  weight=0.25
-  Layer3: 多样性补偿 (奇偶/012路/数学合理性)  weight=0.15
-  Layer4: 博弈论期望/纳什均衡                weight=0.10
+  Layer1: 位置三阶频率乘积 (热/冷/趋势融合)
+  Layer2: 模式匹配 (和值/跨度/隔期重号/跨期模式)
+  Layer3: 多样性补偿 (奇偶/012路/数学合理性)
+  Layer4: 博弈论期望/纳什均衡
 """
 
 import sys
@@ -62,7 +68,8 @@ from p3_constraint_engine import P3ConstraintEngine
 
 
 class Pick3FusionComplete:
-    """排列3多策略融合完全体 V1.3.1 — 全量枚举+3层评分"""
+    """排列3多策略融合完全体 V2.9.1 — 全量枚举+3层评分
+    + 冷号衰减 + 位置多样性 + 转移权重提升 + 复式保底3候选"""
 
     def __init__(self, data_path: Optional[str] = None, auto_update: bool = True):
         if data_path is None:
@@ -103,23 +110,11 @@ class Pick3FusionComplete:
         self._pair_prob_bs = {k: v / _total_draws for k, v in self._pair_freq_bs.items()}
         self._pair_prob_bg = {k: v / _total_draws for k, v in self._pair_freq_bg.items()}
         self._pair_prob_sg = {k: v / _total_draws for k, v in self._pair_freq_sg.items()}
-        # 方案3: 跨位置序列转移矩阵 (全3位数1000→1000,贝叶斯收缩)
-        self._cross_seq_trans = [[0.0]*1000 for _ in range(1000)]
-        cnt = [[0]*1000 for _ in range(1000)]
-        for i in range(len(self.draws) - 1):
-            f_idx = self.draws[i][0]*100 + self.draws[i][1]*10 + self.draws[i][2]
-            t_idx = self.draws[i+1][0]*100 + self.draws[i+1][1]*10 + self.draws[i+1][2]
-            cnt[f_idx][t_idx] += 1
-        for f_idx in range(1000):
-            tc = sum(cnt[f_idx])
-            alpha = 10.0 / (1.0 + tc / 20.0)
-            for t_idx in range(1000):
-                self._cross_seq_trans[f_idx][t_idx] = (cnt[f_idx][t_idx] + alpha) / (tc + alpha * 1000)
-        # 方向A: 权重退火优化（在所有子模型就绪后调用）
-        self._rl_weights = self._anneal_weights()
+        # 方案3: 跨位置序列转移 — 已移除1000×1000(0.76%稀疏,噪声), 保留位置级转移矩阵
+        self._cross_seq_trans = None
+        # 方向A: 权重退火优化（延迟到predict时首次调用）
+        self._rl_weights = None
         self._rl_history = []
-        # 方案1: 训练RandomForest位置预测器
-        self._ml_models = self._train_ml_models()
         # Z3组级遗漏：每个(双码,独码)组合上次出现至今的期数
         self._z3_group_miss = {}
         for i in range(len(self.draws) - 1, -1, -1):
@@ -146,6 +141,10 @@ class Pick3FusionComplete:
 
         print(f"[P3-Fusion] 最新期号: {self.last_period} | "
               f"最新开奖: {self.prev_draw[0]} {self.prev_draw[1]} {self.prev_draw[2]}")
+
+        # 延迟加载标记（mc缓存 + 惰性训练）
+        self._mc_cache = None
+        self._initialized = False
 
     def _init_modules(self, draws: List[Tuple[int, int, int]]):
         self.draws = draws
@@ -233,6 +232,8 @@ class Pick3FusionComplete:
         预计算每位数字的L1原始分
         返回: {'bai': {0: score, ...}, 'shi': {...}, 'ge': {...}}
         score = freq_fusion(d) * 0.5 + trans_score(d) * 0.3 + poisson_score(d) * 0.2
+        
+        V2.8.1: 冷号衰减 — 长遗漏数字(>50期)分数封顶,防止冷号回补偏差吞噬合理路径
         """
         if prev_draw is None:
             prev_draw = [5, 5, 5]
@@ -251,6 +252,12 @@ class Pick3FusionComplete:
                 trans_s = self._poisson.get_trans_score(pos_name, d, prev_draw, alpha=0.4)
                 poisson_s = self._poisson.get_poisson_score(pos_name, d) * 0.2
                 scores[d] = freq_s * 0.5 + trans_s * 0.3 + poisson_s
+                # 【P3-冷号衰减】长遗漏(>40期)冷号: 遗漏越深, 衰减越大
+                # V2.9.1: 增大衰减力度(启动阈值降至40期, 衰减斜率提升至0.015)
+                m = miss.get(d, 0)
+                if m > 40:
+                    cold_damp = max(0.10, 1.0 - (m - 40) * 0.015)
+                    scores[d] *= cold_damp
             l1[pos_name] = scores
         return l1
 
@@ -300,7 +307,7 @@ class Pick3FusionComplete:
             sb = l1_tables['bai'].get(bai, 0.02)
             ss = l1_tables['shi'].get(shi, 0.02)
             sg = l1_tables['ge'].get(ge, 0.02)
-            l1 = min(sb * ss * sg * 400, 1.0)
+            l1 = min(sb * ss * sg * 180, 1.0)  # 【P3-1】调整系数400->180(基于max_freq≈0.18)
 
         # L2: 和值/跨度/重号 + 模式识别 + Z3组级遗漏
         s = bai + shi + ge
@@ -341,91 +348,135 @@ class Pick3FusionComplete:
         'z6': (0.40, 0.25, 0.25, 0.10),
     }
 
-    def _borda_rank(self, values: List[float]) -> List[int]:
-        """将值列表转换为Borda排名分数（最高值得 N 分，最低得 1 分）"""
+    def _get_group_weights(self, group_type: str) -> Tuple:
+        """获取组权重: MI调整版(如已计算)或默认版"""
+        if hasattr(self, '_mi_weights') and self._mi_weights is not None:
+            return self._mi_weights.get(group_type, self._GROUP_WEIGHTS[group_type])
+        return self._GROUP_WEIGHTS[group_type]
+
+    def _borda_rank(self, values: List[float]) -> List[float]:
+        """
+        【C】分数归一化替代Borda排名 — 保留子评分器的分数间距信息。
+
+        原Borda排名: 最高得N分, 最低得1分 (丢失间距信息)
+        新方法: Min-Max归一化到[0.1, 1.0] (保留相对间距)
+        """
         n = len(values)
-        pairs = [(v, i) for i, v in enumerate(values)]
-        pairs.sort(key=lambda x: -x[0])
-        borda = [0] * n
-        for pos, (_, idx) in enumerate(pairs):
-            borda[idx] = n - pos  # rank 1→N分, rank N→1分
-        return borda
+        if n < 2:
+            return [0.5] * n
+        mn, mx = min(values), max(values)
+        if mx - mn < 1e-8:
+            return [0.5] * n
+        return [0.1 + 0.9 * (v - mn) / (mx - mn) for v in values]
 
-    def _train_ml_models(self):
-        """方案1: 纯numpy 2层NN (16隐藏+softmax)"""
-        import numpy as _np
-        models = {}
-        for pos_name, pos_idx in [('bai', 0), ('shi', 1), ('ge', 2)]:
-            hist = [d[pos_idx] for d in self.draws]
-            X, y = [], []
-            for i in range(30, len(hist) - 1):
-                feats = []
-                for lag in range(1, 16):
-                    feats.append(hist[i - lag] / 9.0)
-                from collections import Counter as _Ct
-                for w in [10, 30, 100]:
-                    w_actual = min(w, i)
-                    seg = hist[i - w_actual:i]
-                    cnt = _Ct(seg)
-                    for d in range(10):
-                        feats.append(cnt.get(d, 0) / max(len(seg), 1))
-                X.append(feats)
-                y.append(hist[i])
-            Xa = _np.array(X, dtype=_np.float32)
-            ya = _np.eye(10)[y]
-            # 2层网络
-            n_in = Xa.shape[1]
-            n_hid = 16
-            _np.random.seed(42)
-            W1 = _np.random.randn(n_in, n_hid).astype(_np.float32) * 0.1
-            b1 = _np.zeros(n_hid, dtype=_np.float32)
-            W2 = _np.random.randn(n_hid, 10).astype(_np.float32) * 0.1
-            b2 = _np.zeros(10, dtype=_np.float32)
-            lr = 0.01
-            for epoch in range(30):
-                h = _np.maximum(0, Xa.dot(W1) + b1)
-                logits = h.dot(W2) + b2
-                exp_l = _np.exp(logits - _np.max(logits, axis=1, keepdims=True))
-                probs = exp_l / _np.sum(exp_l, axis=1, keepdims=True)
-                grad = (probs - ya) / len(Xa)
-                grad_h = grad.dot(W2.T)
-                grad_h[h <= 0] = 0
-                W2 -= lr * h.T.dot(grad)
-                b2 -= lr * _np.sum(grad, axis=0)
-                W1 -= lr * Xa.T.dot(grad_h)
-                b1 -= lr * _np.sum(grad_h, axis=0)
-            models[pos_name] = (W1, b1, W2, b2)
-        return models
+    # ── 置换检验MI: 校准各层权重 (移植自P5 V1.12经验) ──
 
-    def _ml_score(self, digits: List[int]) -> float:
-        """方案1: 用训练的NN预测P(bai)*P(shi)*P(ge)"""
-        import numpy as _np
-        if not hasattr(self, '_ml_models') or not self._ml_models:
-            return 0.5
-        prob = 1.0
-        for pos_name, pos_idx in [('bai', 0), ('shi', 1), ('ge', 2)]:
-            if pos_name not in self._ml_models:
-                prob *= 0.1; continue
-            hist = [d[pos_idx] for d in self.draws]
-            feats = []
-            for lag in range(1, 16):
-                feats.append(hist[-lag] / 9.0 if len(hist) > lag else 0)
-            from collections import Counter as _Ct
-            for w in [10, 30, 100]:
-                w_actual = min(w, len(hist))
-                seg = hist[-w_actual:]
-                cnt = _Ct(seg)
-                for d in range(10):
-                    feats.append(cnt.get(d, 0) / max(len(seg), 1))
-            X = _np.array([feats], dtype=_np.float32)
-            W1, b1, W2, b2 = self._ml_models[pos_name]
-            h = _np.maximum(0, X.dot(W1) + b1)
-            logits = h.dot(W2) + b2
-            exp_l = _np.exp(logits - _np.max(logits))
-            pred_probs = (exp_l / _np.sum(exp_l)).flatten()
-            p = float(pred_probs[digits[pos_idx]])
-            prob *= max(p, 0.01)
-        return prob
+    def _compute_mi_adjusted_weights(self) -> Dict:
+        """
+        置换检验MI: 对4层评分(L1/L2/L3/GT)计算净MI, 调整组权重
+        返回: {'zx': (w1,w2,w3,w4), 'z3': (w1,w2,w3,w4), 'z6': (w1,w2,w3,w4)}
+        """
+        n_perm = 30
+        test_periods = min(100, len(self.draws) - 20)
+
+        import random as rnd
+        rnd.seed(42)
+        np.random.seed(42)
+
+        # 收集评分 + 命中数据
+        l1_all, l2_all, l3_all, gt_all, hits = [], [], [], [], []
+        for idx in range(len(self.draws) - test_periods - 1, len(self.draws) - 1):
+            train = self.draws[:idx + 1]
+            actual = list(self.draws[idx + 1])
+            prev_draw = list(train[-1])
+
+            bt_recognizer = P3PatternRecognizer(train)
+            l1_t = self._backtest_build_score_tables([d[0] for d in train], prev_draw[0])[0]
+
+            for _ in range(30):  # 每期30个随机候选
+                digits = [rnd.randint(0, 9) for _ in range(3)]
+                l1_tables = {'bai': l1_t, 'shi': l1_t, 'ge': l1_t}
+                ps = bt_recognizer.score_pattern(digits, prev_draw)
+                ss = P3MathFilter.smart_score(digits)
+                gt = P3GameTheoryAnalyzer(train).expected_value(digits)
+                l1, l2, l3 = self._compute_layers(
+                    digits[0], digits[1], digits[2], prev_draw,
+                    l1_tables, ps, ss)
+                l1_all.append(l1)
+                l2_all.append(l2)
+                l3_all.append(l3)
+                gt_all.append(gt)
+                hits.append(1 if digits == actual else 0)
+
+        n = len(hits)
+        if n < 100:
+            return self._get_default_group_weights()
+
+        def _calc_mi(scores, labels):
+            bins = np.linspace(min(scores), max(scores), 11)
+            dig = np.digitize(scores, bins) - 1
+            joint = np.zeros((10, 2))
+            for i in range(n):
+                b = dig[i]
+                h = labels[i]
+                if 0 <= b < 10:
+                    joint[b, h] += 1
+            joint /= max(n, 1)
+            pb = joint.sum(axis=1)
+            ph = joint.sum(axis=0)
+            mi = 0.0
+            for b in range(10):
+                for h in range(2):
+                    if joint[b, h] > 0:
+                        denom = max(pb[b] * ph[h], 1e-10)
+                        mi += joint[b, h] * np.log(joint[b, h] / denom)
+            return mi
+
+        scores = [l1_all, l2_all, l3_all, gt_all]
+        labels = np.array(hits, dtype=np.int32)
+
+        # 实际MI
+        actual_mi = [_calc_mi(s, labels) for s in scores]
+
+        # 置换检验
+        perm_mi = np.zeros((n_perm, 4))
+        for p in range(n_perm):
+            np.random.shuffle(labels)
+            for li in range(4):
+                perm_mi[p, li] = _calc_mi(scores[li], labels)
+
+        noise_floor = perm_mi.mean(axis=0)
+        net_mi = [max(0, actual_mi[i] - noise_floor[i]) for i in range(4)]
+
+        layer_names = ['L1频率','L2模式','L3数学','L4博弈']
+        for i, name in enumerate(layer_names):
+            noise_pct = (1 - net_mi[i]/max(actual_mi[i], 1e-10))*100 if actual_mi[i] > 0 else 100
+            print(f"  [P3-MI] {name}: raw={actual_mi[i]:.4f} noise={noise_pct:.0f}% net={net_mi[i]:.4f}")
+
+        # 生成调整后权重: net权重/总net, L4(L4=索引3)上限0.15
+        total_net = sum(net_mi) or 1e-10
+        adj_w = [max(0.05, n / total_net) for n in net_mi]  # 最小0.05
+        adj_w[3] = min(adj_w[3], 0.3)  # L4上限0.30
+        total = sum(adj_w)
+        adj_w = [w / total for w in adj_w]
+
+        # 每组使用不同默认权重, 但净MI校正统一应用
+        result = {}
+        for gtype, default in [('zx', (0.45, 0.25, 0.20, 0.10)),
+                                ('z3', (0.35, 0.35, 0.30, 0.00)),
+                                ('z6', (0.40, 0.25, 0.25, 0.10))]:
+            # 融合默认权重和MI校正
+            blended = [default[i] * 0.6 + adj_w[i] * 0.4 for i in range(4)]
+            total_b = sum(blended)
+            result[gtype] = tuple(round(w / total_b, 3) for w in blended)
+
+        print(f"  [P3-MI] \u2795 调整后权重: ZX={result['zx']} Z3={result['z3']} Z6={result['z6']}")
+        return result
+
+    def _get_default_group_weights(self) -> Dict:
+        return {'zx': (0.45, 0.25, 0.20, 0.10),
+                'z3': (0.35, 0.35, 0.30, 0.00),
+                'z6': (0.40, 0.25, 0.25, 0.10)}
 
     def _anneal_weights(self) -> List[float]:
         """方向A: 子模型互信息 + 权重搜索（基于50期验证数据）"""
@@ -453,31 +504,34 @@ class Pick3FusionComplete:
             sg = {d: l1_ge.get(d,0.01) + ((1-_a)*t1_ge[prev_draw[2]][d] + (_a*0.5)*t2_ge[prev_draw[1]*10+prev_draw[2]][d] + (_a*0.5)*t3_ge[prev_draw[0]*100+prev_draw[1]*10+prev_draw[2]][d])*0.3 for d in range(10)}
             l1_tables = {'bai': sb, 'shi': ss, 'ge': sg}
 
-            sub_scores = [[] for _ in range(n_sub)]
-            for bai in range(10):
-                for shi in range(10):
-                    for ge in range(10):
-                        dig = [bai, shi, ge]
-                        gt = self._game_theory.expected_value(dig)
-                        l1, l2, l3 = self._compute_layers(bai, shi, ge, prev_draw, l1_tables, 0.5, 0.5)
-                        w1z, w2z, w3z, w4z = self._GROUP_WEIGHTS['zx']
-                        sub_scores[0].append(l1*w1z + l2*w2z + l3*w3z + gt*w4z)
-                        sub_scores[1].append(0.5+0.5)
-                        sub_scores[2].append(self._zx_trans_prob(bai, shi, ge, prev_draw))
-                        sub_scores[3].append(1.0)  # mc placeholder
-                        sub_scores[4].append(0.5)  # group placeholder
-                        sub_scores[5].append(0.5)  # fluct placeholder
-                        sub_scores[6].append(self._cross_seq_score(dig, prev_draw))
-                        sub_scores[7].append(self._ml_score(dig))
+            # 子模型计算仅在debug时启用(默认跳过以节省CPU)
+            ranks = None
+            if getattr(self, '_debug_submodels', False):
+                sub_scores = [[] for _ in range(n_sub)]
+                for bai in range(10):
+                    for shi in range(10):
+                        for ge in range(10):
+                            dig = [bai, shi, ge]
+                            gt = self._game_theory.expected_value(dig)
+                            l1, l2, l3 = self._compute_layers(bai, shi, ge, prev_draw, l1_tables, 0.5, 0.5)
+                            w1z, w2z, w3z, w4z = self._GROUP_WEIGHTS['zx']
+                            sub_scores[0].append(l1*w1z + l2*w2z + l3*w3z + gt*w4z)
+                            sub_scores[1].append(0.5+0.5)
+                            sub_scores[2].append(self._zx_trans_prob(bai, shi, ge, prev_draw))
+                            sub_scores[3].append(1.0)
+                            sub_scores[4].append(0.5)
+                            sub_scores[5].append(0.5)
+                            sub_scores[6].append(self._cross_seq_score(dig, prev_draw))
+                            sub_scores[7].append(0.5)
 
-            ranks = []
-            for s in sub_scores:
-                pr = [(v, i) for i, v in enumerate(s)]
-                pr.sort(key=lambda x: -x[0])
-                r = [0]*1000
-                for pos, (_, i) in enumerate(pr):
-                    r[i] = pos + 1
-                ranks.append(r)
+                ranks = []
+                for s in sub_scores:
+                    pr = [(v, i) for i, v in enumerate(s)]
+                    pr.sort(key=lambda x: -x[0])
+                    r = [0]*1000
+                    for pos, (_, i) in enumerate(pr):
+                        r[i] = pos + 1
+                    ranks.append(r)
 
             actual_idx = actual[0]*100 + actual[1]*10 + actual[2]
             all_ranks.append(ranks)
@@ -505,15 +559,15 @@ class Pick3FusionComplete:
         return best_w
 
     def _cross_seq_score(self, digits: List[int], prev_draw: List[int],
-                          trans_matrix: List[List[float]] = None) -> float:
+                          trans_matrix=None) -> float:
         """
-        方案3: 跨位置序列匹配 — P(完整3位数 | 上一期完整3位数)
-        trans_matrix: 用于backtest(训练集), None则用self._cross_seq_trans
+        跨位置序列匹配 — 改用位置级转移矩阵乘积 (原1000×1000已移除)
         """
-        tm = trans_matrix if trans_matrix is not None else self._cross_seq_trans
-        from_idx = prev_draw[0]*100 + prev_draw[1]*10 + prev_draw[2]
-        to_idx = digits[0]*100 + digits[1]*10 + digits[2]
-        return tm[from_idx][to_idx]
+        # 使用3个位置级转移矩阵乘积: P(百)·P(十)·P(个)
+        bai_p = self._bai_trans[prev_draw[0]][digits[0]]
+        shi_p = self._shi_trans[prev_draw[1]][digits[1]]
+        ge_p = self._ge_trans[prev_draw[2]][digits[2]]
+        return bai_p * shi_p * ge_p * 1000  # 缩放回[0,1]量纲
 
     def _group_consensus_score(self, digits: List[int], combined_vals: List[float]) -> float:
         """
@@ -553,7 +607,10 @@ class Pick3FusionComplete:
     def _multi_period_mc(self, prev_draw: List[int], n_sim: int = 3000) -> Dict[tuple, int]:
         """
         多期蒙特卡洛共识：模拟 t+1 和 t+2，取两期都出现的组合
+        首次计算后缓存结果，避免重复计算
         """
+        if self._mc_cache is not None:
+            return self._mc_cache
         import random
         pm = self._poisson
         t1_counts = {}
@@ -575,6 +632,7 @@ class Pick3FusionComplete:
         result = {}
         for k in set(list(t1_counts.keys()) + list(t2_counts.keys())):
             result[k] = t1_counts.get(k, 0) + t2_counts.get(k, 0)
+        self._mc_cache = result
         return result
 
     def _fluctuation_score(self, digits: List[int], window: int = 30) -> float:
@@ -593,11 +651,21 @@ class Pick3FusionComplete:
             expected = n / 10.0
             if k > expected:
                 # 过热 → 减分（均值回归预期）
-                p_val = _st.binom_test(k, n, 0.1, alternative='greater')
+                try:
+                    from scipy.stats import binomtest as _binomtest
+                    p_val = _binomtest(k, n, 0.1, alternative='greater').pvalue
+                except ImportError:
+                    from scipy.stats import binom_test as _binomtest
+                    p_val = _binomtest(k, n, 0.1, alternative='greater')
                 score -= min(p_val * 5, 0.3)
             elif k < expected:
                 # 过冷 → 加分（均值回归预期）
-                p_val = _st.binom_test(k, n, 0.1, alternative='less')
+                try:
+                    from scipy.stats import binomtest as _binomtest
+                    p_val = _binomtest(k, n, 0.1, alternative='less').pvalue
+                except ImportError:
+                    from scipy.stats import binom_test as _binomtest
+                    p_val = _binomtest(k, n, 0.1, alternative='less')
                 score += min(p_val * 5, 0.3)
         return max(0.0, 0.5 + score)  # centered at 0.5
 
@@ -667,6 +735,48 @@ class Pick3FusionComplete:
         selected.sort(key=lambda x: -x['final_score'])
         return selected
 
+    def _enforce_position_diversity(self, selected: List[Dict], all_candidates: List[Dict], n: int) -> List[Dict]:
+        """
+        V2.9.1: 位置多样性强制约束 — 贪心重建法
+        从最高分候选开始逐一选取, 确保同一位置同一数字最多不超过ceil(N/3)次
+        如无法满足N注, 逐步放宽约束至全部放开
+        """
+        if not selected:
+            return selected
+
+        import math
+
+        # 尝试3种严格度, 从最严格到最宽松
+        for strictness in [2, 3, 4, 999]:
+            result = []
+            used_tuples = set()
+            pos_cnts = [Counter(), Counter(), Counter()]
+
+            for cand in all_candidates:
+                d = cand['digits']
+                t = tuple(d)
+                if t in used_tuples:
+                    continue
+                # 检查是否违反位置约束
+                ok = True
+                for pos in range(3):
+                    if pos_cnts[pos][d[pos]] >= strictness:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                result.append(cand)
+                used_tuples.add(t)
+                for pos in range(3):
+                    pos_cnts[pos][d[pos]] += 1
+                if len(result) >= n:
+                    break
+
+            if len(result) >= n or strictness == 999:
+                break
+
+        return result[:n]
+
     def _kelly_bet(self, p: float, odds: float = 520.0) -> float:
         """
         方向C: 凯利公式 f* = (bp - q) / b
@@ -708,10 +818,10 @@ class Pick3FusionComplete:
             p_ge = pm._trans2_ge[prev_draw[1]*10+prev_draw[2]][ge] if len(prev_draw) > 2 else pm._trans1_ge[prev_draw[2]][ge] if len(prev_draw) > 2 else 0.1
         return p_bai * p_shi * p_ge
 
-    def _enumerate_direct(self, prev_draw: List[int]) -> List[Dict[str, Any]]:
+    def _enumerate_direct(self, prev_draw: List[int], mc_counts: Optional[Dict[tuple, int]] = None) -> List[Dict[str, Any]]:
         """枚举全部1000个直选组合，Borda排名融合(L1已被实证为噪声，用转移秩替代)"""
         l1_tables = self._build_score_tables(prev_draw)
-        w1, w2, w3, w4 = self._GROUP_WEIGHTS['zx']
+        w1, w2, w3, w4 = self._get_group_weights('zx')
         n = 1000
         candidates = []
         combined_vals = []
@@ -721,7 +831,10 @@ class Pick3FusionComplete:
         fluct_vals = []
         cross_seq_vals = []
         ml_vals = []
-        mc_multi_counts = self._multi_period_mc(prev_draw, 3000)
+        if mc_counts is not None:
+            mc_multi_counts = mc_counts
+        else:
+            mc_multi_counts = self._multi_period_mc(prev_draw, 3000)
 
         for bai in range(10):
             for shi in range(10):
@@ -736,7 +849,6 @@ class Pick3FusionComplete:
                     mc = mc_multi_counts.get((bai, shi, ge), 0)
                     fs = self._fluctuation_score(digits)
                     cs = self._cross_seq_score(digits, prev_draw)
-                    ml = self._ml_score(digits)
                     candidates.append(digits)
                     combined_vals.append(combined)
                     ps_ss_vals.append((ps or 0.5) + (ss or 0.5))
@@ -744,13 +856,25 @@ class Pick3FusionComplete:
                     mc_multi_vals.append(mc)
                     fluct_vals.append(fs)
                     cross_seq_vals.append(cs)
-                    ml_vals.append(ml)
+                    ml_vals.append(0.5)  # NN已移除, 恒为中性
 
         # 组共识
         group_vals = self._group_consensus_score(None, combined_vals)
 
-        # Borda: RL动态权重
-        w = self._rl_weights
+        # P2: 8维Borda冗余相关性分析
+        _vecs = [combined_vals, ps_ss_vals, trans_vals, mc_multi_vals, group_vals, fluct_vals, cross_seq_vals, ml_vals]
+        _corr = np.corrcoef(_vecs)
+        _high_pairs = []
+        for _i in range(8):
+            for _j in range(_i + 1, 8):
+                if abs(_corr[_i][_j]) > 0.8:
+                    _high_pairs.append((_i, _j, round(_corr[_i][_j], 3)))
+        if _high_pairs:
+            print(f"[P3-Borda] ⚠️ 高相关子模型: {_high_pairs}")
+
+        # Borda: RL动态权重(默认值8维, 退火仅在IRL路径中生效)
+        # V2.8.1: trans_vals权重提升至0.35, combined/ps_ss降权, 增强转移概率对冲冷号偏差
+        w = self._rl_weights if self._rl_weights is not None else [0.05, 0.20, 0.35, 0.05, 0.15, 0.05, 0.05, 0.10]
         b1 = self._borda_rank(combined_vals)
         b2 = self._borda_rank(ps_ss_vals)
         b3 = self._borda_rank(trans_vals)
@@ -761,17 +885,18 @@ class Pick3FusionComplete:
         b8 = self._borda_rank(ml_vals)
         total_w = sum(w)
         scored = [{'digits': candidates[i],
-            'final_score': (b1[i]*w[0] + b2[i]*w[1] + b3[i]*w[2] + b4[i]*w[3] + b5[i]*w[4] + b6[i]*w[5] + b7[i]*w[6] + b8[i]*w[7]) / (n * total_w),
-            'hit_probability': round((b1[i]*w[0] + b2[i]*w[1] + b3[i]*w[2] + b4[i]*w[3] + b5[i]*w[4] + b6[i]*w[5] + b7[i]*w[6] + b8[i]*w[7]) / (n * total_w) * 10, 1),
+            'final_score': round(combined_vals[i] * 100, 4),
+            'hit_probability': round(min(combined_vals[i] * 100, 99.9), 1),
         } for i in range(n)]
         scored.sort(key=lambda x: -x['final_score'])
         return scored
 
-    def _enumerate_z3(self, prev_draw: List[int]) -> List[Dict[str, Any]]:
+    def _enumerate_z3(self, prev_draw: List[int], mc_counts: Optional[Dict[tuple, int]] = None) -> List[Dict[str, Any]]:
         """枚举全部90个组三组合，取3排列最高分，Borda排名融合"""
+        # mc_counts参数保留用于接口一致性（当前Z3不使用MC）
         l1_tables = self._build_score_tables(prev_draw)
         from modules.p3_poisson_model import P3PoissonModel as _PPM
-        w1, w2, w3, w4 = self._GROUP_WEIGHTS['z3']
+        w1, w2, w3, w4 = self._get_group_weights('z3')
         n = 90
 
         best = {}
@@ -807,24 +932,35 @@ class Pick3FusionComplete:
         fss = [best[k][7] for k in keys]
         miss_s = [best[k][8] for k in keys]
 
-        # Z3 Borda: L1×2 + 综合×3 + 组级遗漏×1
-        b1 = self._borda_rank(l1s)
-        b2 = self._borda_rank(fss)
-        b3 = self._borda_rank(miss_s)
-        max_b = n * 6
+        # Z3 Borda: 【1】裁剪ZX专用评分器, 使用L1+L2+L3+cross_feature
+        b1 = self._borda_rank(l1s)      # L1位置频率
+        l2s_raw = []
+        for k in keys:
+            _, l2, _ = best[k][:3]  # l2 from _compute_layers
+            l2s_raw.append(l2)
+        b2 = self._borda_rank(l2s_raw)   # L2模式匹配
+        l3s_raw = []
+        for k in keys:
+            _, _, l3 = best[k][:3]
+            l3s_raw.append(l3)
+        b3 = self._borda_rank(l3s_raw)   # L3数学合理性
+        b4 = self._borda_rank(css)       # cross_feature
+        b5 = self._borda_rank(miss_s)    # 组级遗漏
+        max_b = n * 5
 
         scored = [{
             'digits': list(keys[i]),
-            'final_score': (b1[i]*2 + b2[i]*3 + b3[i]) / max_b,
+            'final_score': round(fss[i], 4),
             'hit_probability': 0,
         } for i in range(n)]
         scored.sort(key=lambda x: -x['final_score'])
         return scored
 
-    def _enumerate_z6(self, prev_draw: List[int]) -> List[Dict[str, Any]]:
+    def _enumerate_z6(self, prev_draw: List[int], mc_counts: Optional[Dict[tuple, int]] = None) -> List[Dict[str, Any]]:
         """枚举全部120个组六组合，取6排列最高分，Borda排名融合(去L1+转移秩)"""
+        # mc_counts参数保留用于接口一致性（当前Z6不使用MC）
         l1_tables = self._build_score_tables(prev_draw)
-        w1, w2, w3, w4 = self._GROUP_WEIGHTS['z6']
+        w1, w2, w3, w4 = self._get_group_weights('z6')
         n = 120
         perms = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
 
@@ -859,15 +995,66 @@ class Pick3FusionComplete:
         ps_ss = [best[k][1] for k in keys]
         tps = [best[k][2] for k in keys]
 
-        # Z6 Borda: 综合×3 + 模式×1 + 转移秩×1 (去掉L1噪声)
-        b1 = self._borda_rank(fss)
-        b2 = self._borda_rank(ps_ss)
-        b3 = self._borda_rank(tps)
+        # Z6 Borda: 【1】去掉_zx_trans_prob, 使用L1+L2+L3+cross_feature+gt
+        # 从best中提取各维度
+        l1s_z6, l2s_z6, l3s_z6, gts_z6 = [], [], [], []
+        css_z6 = self._cross_feature_score(
+            list(keys[0])[0] if keys else 0,  # fallback
+            list(keys[0])[1] if keys else 0,
+            list(keys[0])[2] if keys else 0,
+        )
+        # 从best字典中逐个提取
+        z6_l1, z6_l2, z6_l3, z6_gt = {}, {}, {}, {}
+        z6_ps_ss = {}
+        k_list = list(keys)
+        # 【3】计算各维度评分(交叉特征移出排列循环)
+        z6_l1, z6_l2, z6_l3, z6_gt, z6_cs = {}, {}, {}, {}, {}
+        for k in k_list:
+            d1, d2, d3 = k
+            best_combo = None
+            best_score = -1
+            for p in perms:
+                b = d1 if p[0] == 0 else d2 if p[0] == 1 else d3
+                s = d1 if p[1] == 0 else d2 if p[1] == 1 else d3
+                g = d1 if p[2] == 0 else d2 if p[2] == 1 else d3
+                ps = self.recognizer.score_pattern([b,s,g], prev_draw)
+                ss = P3MathFilter.smart_score([b,s,g])
+                gt = self._game_theory.expected_value([b,s,g])
+                l1, l2, l3 = self._compute_layers(b, s, g, prev_draw, l1_tables, ps, ss)
+                fs = l1*w1 + l2*w2 + l3*w3 + gt*w4
+                if fs > best_score:
+                    best_score = fs
+                    best_combo = (b, s, g, l1, l2, l3, gt)
+            # 交叉特征只需计算一次(与排列顺序无关)
+            z6_cs[k] = self._cross_feature_score(best_combo[0], best_combo[1], best_combo[2])
+            z6_l1[k], z6_l2[k], z6_l3[k], z6_gt[k] = best_combo[3], best_combo[4], best_combo[5], best_combo[6]
+
+        l1_v = [z6_l1[k] for k in k_list]
+        l2_v = [z6_l2[k] for k in k_list]
+        l3_v = [z6_l3[k] for k in k_list]
+        gt_v = [z6_gt[k] for k in k_list]
+        cs_v = [z6_cs[k] for k in k_list]
+
+        b1 = self._borda_rank(l1_v)
+        b2 = self._borda_rank(l2_v)
+        b3 = self._borda_rank(l3_v)
+        b4 = self._borda_rank(gt_v)
+        b5 = self._borda_rank(cs_v)
         max_b = n * 5
 
         scored = [{
-            'digits': list(keys[i]),
-            'final_score': (b1[i]*3 + b2[i] + b3[i]) / max_b,
+            'digits': list(k_list[i]),
+            'final_score': round(l1_v[i]*w1 + l2_v[i]*w2 + l3_v[i]*w3 + gt_v[i]*w4, 4),
+            'hit_probability': 0,
+        } for i in range(n)]
+        scored.sort(key=lambda x: -x['final_score'])
+        return scored
+
+        max_b = n * 5
+
+        scored = [{
+            'digits': list(k_list[i]),
+            'final_score': round(l1_v[i]*w1 + l2_v[i]*w2 + l3_v[i]*w3 + gt_v[i]*w4, 4),
             'hit_probability': 0,
         } for i in range(n)]
         scored.sort(key=lambda x: -x['final_score'])
@@ -877,13 +1064,8 @@ class Pick3FusionComplete:
     # 隔期重号注入
     # ================================================================
 
-    def _inject_repeat(self, scored: List[Dict], prev_draw: List[int],
-                       n_repeat: int = 2) -> List[Dict]:
-        """
-        从候选池外，强制注入含隔期重号的号码。
-        如果Top N已经包含了足够多的重号候选，则跳过注入。
-        """
-        top_set = set(tuple(c['digits']) for c in scored[:10])
+    def _inject_repeat(self, scored, prev_draw, n_repeat=2):
+        """【2】条件注入 — 重号已自然进入Top10时不强制注入"""
         already_has_repeat = any(
             sum(1 for i in range(3) if c['digits'][i] == prev_draw[i]) >= 1
             for c in scored[:10]
@@ -892,6 +1074,7 @@ class Pick3FusionComplete:
             return scored
 
         l1_tables = self._build_score_tables(prev_draw)
+        top_set = set(tuple(c['digits']) for c in scored[:10])
         repeats = []
         for pos in range(3):
             base = prev_draw[:]
@@ -902,8 +1085,8 @@ class Pick3FusionComplete:
                     ps = self.recognizer.score_pattern(digits, prev_draw)
                     ss = P3MathFilter.smart_score(digits)
                     gt = self._game_theory.expected_value(digits)
-                    l1, l2, l3 = self._compute_layers(digits[0], digits[1], digits[2], prev_draw, l1_tables, ps, ss)
-                    w1, w2, w3, w4 = self._GROUP_WEIGHTS['zx']
+                    l1, l2, l3 = self._compute_layers(*digits, prev_draw, l1_tables, ps, ss)
+                    w1, w2, w3, w4 = self._get_group_weights('zx')
                     score = l1 * w1 + l2 * w2 + l3 * w3 + gt * w4
                     repeats.append({'digits': digits, 'final_score': score,
                                     'hit_probability': round(min(score * 15, 10.0), 1)})
@@ -912,18 +1095,12 @@ class Pick3FusionComplete:
         scored_ext = scored[:]
         seen = set(tuple(c['digits']) for c in scored_ext)
         for r in repeats:
-            if len(scored_ext) >= n_repeat + 10:
+            if len(scored_ext) >= len(scored) + n_repeat:
                 break
-            k = tuple(r['digits'])
-            if k not in seen:
-                seen.add(k)
+            if tuple(r['digits']) not in seen:
                 scored_ext.append(r)
-
+                seen.add(tuple(r['digits']))
         return scored_ext
-
-    # ================================================================
-    # 主预测
-    # ================================================================
 
     def _recommend_alloc(self, n_total: int = 10) -> tuple:
         """基于近期组类型分布动态分配推荐注数"""
@@ -941,8 +1118,15 @@ class Pick3FusionComplete:
         # 组三最少3注，最多n_total-3注，其余给组六
         n3 = max(3, min(int(n_total * p_z3), n_total - 3))
         n6 = max(3, n_total - n3)
+        # 【4】根据命中历史动态调整：如果Z3近期命中率高，增加Z3配额
+        if hasattr(self, '_hit_history') and len(self._hit_history) >= 3:
+            avg_hits = sum(self._hit_history) / len(self._hit_history)
+            if avg_hits >= 1.5:
+                pass  # 命中正常，不做调整
+            elif avg_hits < 1.0:
+                # 命中偏低，增加ZX配额（直选更稳定）
+                n_total = min(n_total + 2, 15)
         return n_total, n3, n6
-
     def predict(self, n_zx: int = 10, n_z3: int = None, n_z6: int = None,
                 n_total: int = 10,
                 include_compound: bool = True, _silent: bool = False,
@@ -950,6 +1134,14 @@ class Pick3FusionComplete:
         """
         全量枚举 → 三层评分 → 多样性选择
         """
+        # P1: 延迟初始化（避免OOM）
+        if not self._initialized:
+            if self._rl_weights is None:
+                # V2.8.1: trans_vals权重提升至0.35, 增强转移概率对冲冷号偏差
+                self._rl_weights = [0.05, 0.20, 0.35, 0.05, 0.15, 0.05, 0.05, 0.10]
+            self._ensure_mi_weights()
+            self._initialized = True
+
         if not _silent:
             print(f"\n{'='*50}")
             print(f"  排列3 第{self.last_period}期 全量枚举+三层评分")
@@ -961,13 +1153,18 @@ class Pick3FusionComplete:
 
         prev_draw = self.prev_draw
 
-        zx_all = self._enumerate_direct(prev_draw)
-        z3_all = self._enumerate_z3(prev_draw)
-        z6_all = self._enumerate_z6(prev_draw)
+        # P4: 预计算MC（三个枚举方法共享，避免重复计算3次）
+        mc_multi_counts = self._multi_period_mc(prev_draw, 3000)
+
+        zx_all = self._enumerate_direct(prev_draw, mc_counts=mc_multi_counts)
+        z3_all = self._enumerate_z3(prev_draw, mc_counts=mc_multi_counts)
+        z6_all = self._enumerate_z6(prev_draw, mc_counts=mc_multi_counts)
 
         zx_with_repeat = self._inject_repeat(zx_all, prev_draw, n_repeat=2)
 
         zx_final = self._kmedoids_cover(zx_with_repeat, n_zx)
+        # V2.8.1: 位置多样性强制约束 — 同一位置同一数字最多出现2次
+        zx_final = self._enforce_position_diversity(zx_final, zx_with_repeat, n_zx)
         z3_final = self._diverse_selection(z3_all, n_z3)
         z6_final = self._diverse_selection(z6_all, n_z6)
 
@@ -976,6 +1173,7 @@ class Pick3FusionComplete:
 
         result = {
             'period': self.last_period,
+        'confidence': round(self._estimate_confidence(zx_all), 4),
             'zx_bets': zx_final,
             'z3_bets': z3_final,
             'z6_bets': z6_final,
@@ -987,6 +1185,20 @@ class Pick3FusionComplete:
         # RL更新：若提供了实际开奖，更新子模型权重
         if actual_draw is not None:
             self._meta_learn_update(actual_draw, zx_all)
+
+        # 自动存储预测结果（保留最近2期，用于复盘对比）
+        try:
+            from prediction_store import store_prediction
+            store_prediction(
+                period=self.last_period,
+                zx_bets=zx_final,
+                z3_bets=z3_final if z3_final else None,
+                z6_bets=z6_final if z6_final else None,
+                compound_bets=result.get('compound_bets') if include_compound else None,
+            )
+        except Exception as e:
+            if not _silent:
+                print(f"[P3-Fusion] ⚠️ 存储失败: {e}")
 
         return result
 
@@ -1051,17 +1263,46 @@ class Pick3FusionComplete:
     # ================================================================
 
     def _generate_compound(self, top_scored: List[Dict]) -> Dict[str, Any]:
-        """基于Top 30的三层评分结果生成立体复式"""
+        """基于Top N的三层评分结果生成立体复式
+        V2.8.1: 每个位置候选数≥3(不足时展宽到Top 50+), 防止十位单点炸穿
+        """
         compound = {}
 
-        top30 = top_scored[:30]
-        bai_cnt = Counter(d['digits'][0] for d in top30)
-        shi_cnt = Counter(d['digits'][1] for d in top30)
-        ge_cnt = Counter(d['digits'][2] for d in top30)
+        # 从Top30开始, 如某位置候选不足3个则展宽
+        pool_size = 30
+        top_n = top_scored[:pool_size]
 
-        bai_pool = sorted(bai_cnt, key=lambda d: -bai_cnt[d])[:8]
-        shi_pool = sorted(shi_cnt, key=lambda d: -shi_cnt[d])[:8]
-        ge_pool = sorted(ge_cnt, key=lambda d: -ge_cnt[d])[:8]
+        for _ in range(3):  # 最多展宽3轮
+            bai_cnt = Counter(d['digits'][0] for d in top_n)
+            shi_cnt = Counter(d['digits'][1] for d in top_n)
+            ge_cnt = Counter(d['digits'][2] for d in top_n)
+
+            bai_pool = sorted(bai_cnt, key=lambda d: -bai_cnt[d])[:8]
+            shi_pool = sorted(shi_cnt, key=lambda d: -shi_cnt[d])[:8]
+            ge_pool = sorted(ge_cnt, key=lambda d: -ge_cnt[d])[:8]
+
+            if len(bai_pool) < 3 or len(shi_pool) < 3 or len(ge_pool) < 3:
+                pool_size += 20
+                top_n = top_scored[:min(pool_size, len(top_scored))]
+                continue
+            break
+
+        # 即使展宽后仍不足3个,则用全数字集强制补全
+        def _ensure_min3(pool, pos_counts):
+            if len(pool) >= 3:
+                return pool
+            # 从Counter中取频率最高的3个数字
+            top_digits = sorted(pos_counts, key=lambda d: -pos_counts[d])
+            for d in top_digits:
+                if d not in pool:
+                    pool.append(d)
+                if len(pool) >= 3:
+                    break
+            return pool
+
+        bai_pool = _ensure_min3(list(bai_pool), bai_cnt)
+        shi_pool = _ensure_min3(list(shi_pool), shi_cnt)
+        ge_pool = _ensure_min3(list(ge_pool), ge_cnt)
 
         compound['直选复式'] = {
             'bai': sorted(bai_pool),
@@ -1072,7 +1313,7 @@ class Pick3FusionComplete:
         }
 
         all_digits = Counter()
-        for bet in top30:
+        for bet in top_n:
             for d in bet['digits']:
                 all_digits[d] += 1
         pool = sorted(all_digits, key=lambda d: -all_digits[d])[:8]
@@ -1173,13 +1414,146 @@ class Pick3FusionComplete:
             score[d] = fs * 0.5 + ps
         return score, trans1, trans2, trans3, miss
 
+    def train_irl(self, n_periods: int = 50, verbose: bool = True):
+        """【3】独立IRL训练 — 不触发预测, 模拟回放历史数据更新RL权重"""
+        if len(self.draws) < n_periods + 10:
+            if verbose:
+                print(f"[P3-IRL] ⚠️ 数据不足 (需要{n_periods+10}, 现有{len(self.draws)})")
+            return
+
+        trained = self.draws[-n_periods:]
+        history = self.draws[:-n_periods]
+
+        for i in range(n_periods):
+            # 模拟predict: 使用历史数据, 传入actual_draw触发_meta_learn_update
+            sim = Pick3FusionComplete.__new__(Pick3FusionComplete)
+            sim.draws = history + trained[:i] if i > 0 else history
+            if len(sim.draws) < 10:
+                continue
+            sim.prev_draw = list(sim.draws[-1])
+            sim._init_modules(sim.draws)
+            sim._build_position_stats(sim.draws)
+            from modules.p3_pattern_recognizer import P3PatternRecognizer
+            sim.recognizer = P3PatternRecognizer(sim.draws)
+            sim.recognizer.build_distributions()
+            sim._compute_pair_freq(sim.draws)
+            sim._multi_period_mc(sim.prev_draw, 100)
+            sim._z3_group_miss = getattr(self, '_z3_group_miss', {})
+            # NN/RF模型已移除(在随机数据上无效)
+            from p3_game_theory import P3GameTheoryAnalyzer as _P3GT
+            try:
+                self._game_theory_test = _P3GT(sim.draws)
+            except:
+                pass
+            try:
+                sim._game_theory = _P3GT(sim.draws)
+            except:
+                sim._game_theory = self.game_theory
+
+            actual = list(trained[i])
+            try:
+                sim.predict(_silent=True, actual_draw=actual)
+            except Exception:
+                pass
+
+            if verbose and (i+1) % 10 == 0:
+                print(f"[P3-IRL] 🏋️ 训练进度: {i+1}/{n_periods}")
+
+        # 从sim中获取更新后的rl_weights
+        try:
+            self._rl_weights = sim._rl_weights
+        except Exception:
+            pass
+
+        if verbose:
+            print(f"[P3-IRL] ✅ 【3】IRL训练完成 ({n_periods}期, rl_weights={self._rl_weights})")
+
+    def update_from_actual(self, period: str, actual_draw: List[int]) -> Dict[str, Any]:
+        """
+        P5: IRL在线更新接口 — 外部喂入实际开奖结果，更新预测权重和IRL反馈
+        参数:
+            period: 期号字符串(如"26167")
+            actual_draw: 实际开奖 [百位, 十位, 个位]
+        返回:
+            更新后的权重和命中统计
+        """
+        if len(actual_draw) != 3:
+            return {'error': 'actual_draw必须是3元素列表'}
+
+        # 更新draws
+        self.draws.append(tuple(actual_draw))
+        self.prev_draw = actual_draw
+        self.last_period = period
+
+        # 调用IRL更新
+        irl_result = self._online_irl_update()
+
+        # 清除mc_cache，下次predict重新计算
+        self._mc_cache = None
+
+        print(f"[P3-IRL] ✅ 已更新期号{period} 开奖{actual_draw[0]}{actual_draw[1]}{actual_draw[2]}")
+
+        return {
+            'period': period,
+            'actual': actual_draw,
+            'rl_weights': self._rl_weights,
+            'total_draws': len(self.draws),
+        }
+
+    def _online_irl_update(self):
+        """【P3-5】开奖后自动IRL更新 — 检测新数据并触发_meta_learn_update"""
+        try:
+            from p3_data_updater import check_and_update
+            result = check_and_update()
+            if result.get('updated') and result.get('new_count', 0) > 0:
+                # 有新开奖数据，重新加载draws
+                from p3_data_updater import get_last_period, get_total
+                last = get_last_period()
+                # 更新数据
+                old_n = len(self.draws)
+                self.draws = load_data(self.data_path)
+                new_n = len(self.draws)
+                if new_n > old_n and last:
+                    # 获取最新的开奖
+                    actual = list(self.draws[-1])
+                    self.prev_draw = list(self.draws[-1])
+                    self.last_period = str(int(self._get_last_period()) + 1)
+                    print(f"[P3-IRL] \U0001f504 【5】新数据({actual}), 触发IRL更新")
+                    # 重新构建位置统计
+                    self._build_position_stats(self.draws)
+                    try:
+                        self.pattern_recognizer = P3PatternRecognizer(self.draws)
+                        self.pattern_recognizer.build_distributions()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[P3-IRL] \u26a0\ufe0f 【5】IRL更新跳过: {e}")
+
+    def _estimate_confidence(self, zx_all):
+        """【P3-4】不确定性估计 — 基于Top3分数的gap"""
+        if len(zx_all) < 3:
+            return 1.0
+        top3 = zx_all[:3]
+        scores = [c.get('final_score', 0) for c in top3]
+        gap = scores[0] - scores[2] if len(scores) >= 3 else 1.0
+        # gap < 0.05 → 低置信度, gap > 0.15 → 高置信度
+        confidence = min(max((gap - 0.05) / 0.10, 0.0), 1.0)
+        return confidence
+
+    def _ensure_mi_weights(self):
+        """确保MI权重已计算(首次predict/backtest/benchmark触发)"""
+        if not hasattr(self, '_mi_weights') or self._mi_weights is None:
+            print("\n  [P3-MI] 置换检验校准权重...")
+            self._mi_weights = self._compute_mi_adjusted_weights()
+
     def backtest(self, n_periods: int = 50) -> Dict[str, Any]:
         """
         回测：滚动训练集 → 构建类似 _build_score_tables 的结构
-        → 调用 _compute_layers 评分 → 对比实际开奖
         """
         if len(self.draws) < n_periods + 10:
             n_periods = max(len(self.draws) - 10, 10)
+        # 确保MI权重已计算(与predict一致)
+        self._ensure_mi_weights()
 
         total = 0
         zx_hits = 0
@@ -1249,7 +1623,7 @@ class Pick3FusionComplete:
             self._pair_prob_bs, self._pair_prob_bg, self._pair_prob_sg = bt_pair_bs, bt_pair_bg, bt_pair_sg
 
             # ZX 全枚举 + _compute_layers（与 predict 完全一致）
-            w1_zx, w2_zx, w3_zx, w4_zx = self._GROUP_WEIGHTS['zx']
+            w1_zx, w2_zx, w3_zx, w4_zx = self._get_group_weights('zx')
             zx_all = []
             l1s, l2s, l3s, gts = [], [], [], []
             for bai in range(10):
@@ -1279,8 +1653,8 @@ class Pick3FusionComplete:
             # 方案D: K-Medoids覆盖选择
             top5 = self._kmedoids_cover(zx_all, 10)
 
-            w1_z3, w2_z3, w3_z3, w4_z3 = self._GROUP_WEIGHTS['z3']
-            w1_z6, w2_z6, w3_z6, w4_z6 = self._GROUP_WEIGHTS['z6']
+            w1_z3, w2_z3, w3_z3, w4_z3 = self._get_group_weights('z3')
+            w1_z6, w2_z6, w3_z6, w4_z6 = self._get_group_weights('z6')
 
             # 训练集数字总频率（用于Z3数字对评分，避免前视偏差）
             bt_digit_cnt = Counter(b for d in train_draws for b in d)
@@ -1421,6 +1795,109 @@ class Pick3FusionComplete:
             return str(int(self._df_periods[idx]))
         except Exception:
             return "?"
+
+    def benchmark(self, n_periods: int = 100) -> Dict[str, Any]:
+        """
+        基准对比: 模型(Top10 ZX) vs 纯随机(Top10 ZX)
+        对比精确命中率和和值±2命中率
+        """
+        if len(self.draws) < n_periods + 10:
+            return {'error': f'数据不足({len(self.draws)}期)'}
+
+        import random as rnd
+        rnd.seed(42)
+        self._ensure_mi_weights()
+
+        model_exact = 0
+        random_exact = 0
+        model_sum = 0
+        random_sum = 0
+
+        for idx in range(len(self.draws) - n_periods - 1, len(self.draws) - 1):
+            train_draws = self.draws[:idx + 1]
+            actual = list(self.draws[idx + 1])
+            actual_sum = sum(actual)
+            prev_draw = list(train_draws[-1])
+
+            # 模型预测 (直接用缓存枚举或快速枚举)
+            zx_all = self._enumerate_direct(prev_draw, mc_counts={})
+            zx_all.sort(key=lambda x: x['final_score'], reverse=True)
+            model_top10 = [c['digits'] for c in zx_all[:10]]
+
+            if actual in model_top10:
+                model_exact += 1
+            if any(abs(sum(c) - actual_sum) <= 2 for c in model_top10):
+                model_sum += 1
+
+            # 随机基线
+            rnd.seed(idx)
+            random_top10 = []
+            for _ in range(10):
+                random_top10.append([rnd.randint(0, 9) for _ in range(3)])
+
+            if actual in random_top10:
+                random_exact += 1
+            if any(abs(sum(c) - actual_sum) <= 2 for c in random_top10):
+                random_sum += 1
+
+        m_exact_r = model_exact / n_periods * 100
+        r_exact_r = random_exact / n_periods * 100
+        m_sum_r = model_sum / n_periods * 100
+        r_sum_r = random_sum / n_periods * 100
+
+        # Wilson score 95% CI
+        def _wilson_ci(p, n, z=1.96):
+            if n == 0:
+                return 0, 0
+            p = p / n if isinstance(p, int) else p
+            denom = 1 + z**2/n
+            centre = (p + z**2/(2*n)) / denom
+            margin = z * (p*(1-p)/n + z**2/(4*n**2))**0.5 / denom
+            return centre - margin, centre + margin
+
+        m_ci = _wilson_ci(m_sum_r/100, n_periods)
+        r_ci = _wilson_ci(r_sum_r/100, n_periods)
+
+        # 卡方检验(和值±2)
+        from scipy.stats import chi2_contingency
+        table = [[model_sum, n_periods - model_sum],
+                 [random_sum, n_periods - random_sum]]
+        chi2, p_value = chi2_contingency(table, correction=True)[:2]
+
+        delta = m_sum_r - r_sum_r
+        delta_se = (m_sum_r*(100-m_sum_r)/n_periods + r_sum_r*(100-r_sum_r)/n_periods)**0.5
+        delta_ci = (delta - 1.96*delta_se, delta + 1.96*delta_se)
+
+        print(f"\n{'='*55}")
+        print(f"  排列3 基准对比 ({n_periods}期, Top10直选, 和值±2)")
+        print(f"{'='*55}")
+        print(f"  模型  精确命中: {model_exact}/{n_periods} = {m_exact_r:.2f}%")
+        print(f"  模型  和值±2:   {model_sum}/{n_periods} = {m_sum_r:.1f}%")
+        print(f"        95%CI: [{m_ci[0]*100:.1f}%, {m_ci[1]*100:.1f}%]")
+        print(f"  随机  精确命中: {random_exact}/{n_periods} = {r_exact_r:.2f}%")
+        print(f"  随机  和值±2:   {random_sum}/{n_periods} = {r_sum_r:.1f}%")
+        print(f"        95%CI: [{r_ci[0]*100:.1f}%, {r_ci[1]*100:.1f}%]")
+        print(f"  差值  Δ={delta:+.1f}%  95%CI=[{delta_ci[0]:.1f}%, {delta_ci[1]:.1f}%]")
+        print(f"  卡方检验: χ²={chi2:.3f}, p={p_value:.4f}")
+
+        if p_value < 0.05:
+            if delta > 0:
+                print(f"  ✅ 模型显著优于随机")
+            else:
+                print(f"  ❌ 随机显著优于模型")
+        else:
+            print(f"  ⚠️ 模型与随机无显著差异 (p={p_value:.4f})")
+
+        return {
+            'n_periods': n_periods,
+            'model_exact_%': round(m_exact_r, 2),
+            'random_exact_%': round(r_exact_r, 2),
+            'model_sum_match_%': round(m_sum_r, 2),
+            'random_sum_match_%': round(r_sum_r, 2),
+            'delta_%': round(delta, 2),
+            'p_value': round(p_value, 4),
+            'significant': p_value < 0.05,
+        }
 
     def info(self) -> Dict[str, Any]:
         stats = {

@@ -46,41 +46,43 @@ class P3PatternRecognizer:
     # 模式特征提取
     # ================================================================
 
-    @staticmethod
-    def extract_sum(digits: List[int]) -> int:
+    def extract_sum(self, digits: List[int]) -> int:
         return sum(digits)
 
-    @staticmethod
-    def extract_span(digits: List[int]) -> int:
+    def extract_span(self, digits: List[int]) -> int:
         return max(digits) - min(digits)
 
-    @staticmethod
-    def extract_parity_count(digits: List[int]) -> Tuple[int, int]:
+    def extract_parity_count(self, digits: List[int]) -> Tuple[int, int]:
         """(odd_count, even_count)"""
         odd = sum(1 for d in digits if d % 2 == 1)
         return odd, 3 - odd
 
-    @staticmethod
-    def extract_big_small(digits: List[int]) -> Tuple[int, int]:
+    def extract_big_small(self, digits: List[int]) -> Tuple[int, int]:
         """(big_count, small_count), 大≥5"""
         big = sum(1 for d in digits if d >= 5)
         return big, 3 - big
 
-    @staticmethod
-    def extract_repeat_count(current: List[int], prev: List[int]) -> int:
+    def extract_sum_tail(self, digits):
+        """和值尾数（0-9）"""
+        return sum(digits) % 10
+
+    def extract_span_parity(self, digits):
+        """跨度奇偶组合: 奇数跨度或偶数跨度"""
+        span = max(digits) - min(digits)
+        return 'odd' if span % 2 == 1 else 'even'
+
+    def extract_repeat_count(self, current: List[int], prev: List[int]) -> int:
         """与上期对应位置相同的位数"""
         return sum(1 for i in range(3) if current[i] == prev[i])
 
-    @staticmethod
-    def extract_012_route(digits: List[int]) -> Tuple[int, int, int]:
+    def extract_012_route(self, digits: List[int]) -> Tuple[int, int, int]:
         """各数字的 012 路统计"""
         r0 = sum(1 for d in digits if d % 3 == 0)
         r1 = sum(1 for d in digits if d % 3 == 1)
         r2 = sum(1 for d in digits if d % 3 == 2)
         return r0, r1, r2
 
-    @staticmethod
-    def extract_group_type(digits: List[int]) -> str:
+    def extract_group_type(self, digits: List[int]) -> str:
         """组三(2个相同) / 组六(3个不同) / 豹子(3个相同)"""
         s = len(set(digits))
         if s == 1:
@@ -89,8 +91,7 @@ class P3PatternRecognizer:
             return '组三'
         return '组六'
 
-    @staticmethod
-    def extract_prime_count(digits: List[int]) -> int:
+    def extract_prime_count(self, digits: List[int]) -> int:
         return sum(1 for d in digits if d in {2, 3, 5, 7})
 
     def extract_all_features(self, digits: List[int], prev: Optional[List[int]] = None) -> Dict[str, Any]:
@@ -101,6 +102,8 @@ class P3PatternRecognizer:
             'big_small': self.extract_big_small(digits),
             'group_type': self.extract_group_type(digits),
             'prime_count': self.extract_prime_count(digits),
+            'sum_tail': self.extract_sum_tail(digits),
+            'span_parity': self.extract_span_parity(digits),
             'route_012': self.extract_012_route(digits),
         }
         if prev is not None:
@@ -150,6 +153,8 @@ class P3PatternRecognizer:
                          ('big_small', f"{features['big_small'][0]}:{features['big_small'][1]}"),
                          ('group_type', features['group_type']),
                          ('prime_count', features['prime_count']),
+                         ('sum_tail', features['sum_tail']),
+                         ('span_parity', features['span_parity']),
                          ('route_012', f"{features['route_012'][0]}:{features['route_012'][1]}:{features['route_012'][2]}")]:
             if key in features or key in ('parity', 'big_small', 'group_type', 'prime_count', 'route_012'):
                 self._raw_counts.setdefault(key, Counter())[val] += 1
