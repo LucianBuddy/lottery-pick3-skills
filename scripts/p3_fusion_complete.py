@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-排列3 (Pick3) 多策略融合预测系统 V2.9.1
+排列3 (Pick3) 多策略融合预测系统 V2.10.0
 
 全量枚举(1000/90/120) + 置换检验MI权重校准 + 等权重7层
 + 位置级转移(替代1000×1000) + Z3/Z6裁剪 + IRL在线学习
 
-V2.9.1 优化:
-  [1] 冷号衰减 — 长遗漏(>50期)数字L1分数封顶
-  [2] 位置多样性约束 — 同一位置同一数字最多2次
-  [4] 转移概率Borda权重提升(0.2→0.35)
-  [5] 复式每位候选数≥3(自动展宽)
+V2.10.0 优化:
+  [1] 短间隔重号补偿 — 近5期各位置已出数字补入复式池
+  [2] 短间隔转移矩阵 — 最近20期转移矩阵与全量矩阵混合
+  [3] 双通道对齐 — 组选复式数字缺失的位置,自动补入直选复式池
 
 评分体系:
   Layer1: 位置三阶频率乘积 (热/冷/趋势融合)
@@ -212,6 +211,22 @@ class Pick3FusionComplete:
         self._bai_trans = build_transition(bai)
         self._shi_trans = build_transition(shi)
         self._ge_trans = build_transition(ge)
+
+        # 【P3-短间隔转移】最近20期转移矩阵, 捕捉近期重复模式
+        short_w = 20
+        bai_short = bai[-short_w:] if len(bai) >= short_w else bai
+        shi_short = shi[-short_w:] if len(shi) >= short_w else shi
+        ge_short = ge[-short_w:] if len(ge) >= short_w else ge
+        self._bai_trans_short = build_transition(bai_short)
+        self._shi_trans_short = build_transition(shi_short)
+        self._ge_trans_short = build_transition(ge_short)
+
+        # 缓存最近5期每个位置的值, 用于短间隔重号补偿
+        self._recent_5_positions = [
+            [bai[-i] if len(bai) >= i else None for i in range(1, 6)],
+            [shi[-i] if len(shi) >= i else None for i in range(1, 6)],
+            [ge[-i] if len(ge) >= i else None for i in range(1, 6)],
+        ]
 
     def _get_last_period(self) -> str:
         """从数据文件获取最新期号（复用 load_data 结果）"""
@@ -561,13 +576,19 @@ class Pick3FusionComplete:
     def _cross_seq_score(self, digits: List[int], prev_draw: List[int],
                           trans_matrix=None) -> float:
         """
-        跨位置序列匹配 — 改用位置级转移矩阵乘积 (原1000×1000已移除)
+        跨位置序列匹配 — 短间隔(20期)与全量转移矩阵混合
+        blend = 0.4 * P(short) + 0.6 * P(full)
         """
-        # 使用3个位置级转移矩阵乘积: P(百)·P(十)·P(个)
-        bai_p = self._bai_trans[prev_draw[0]][digits[0]]
-        shi_p = self._shi_trans[prev_draw[1]][digits[1]]
-        ge_p = self._ge_trans[prev_draw[2]][digits[2]]
-        return bai_p * shi_p * ge_p * 1000  # 缩放回[0,1]量纲
+        p_bai_full = self._bai_trans[prev_draw[0]][digits[0]]
+        p_shi_full = self._shi_trans[prev_draw[1]][digits[1]]
+        p_ge_full = self._ge_trans[prev_draw[2]][digits[2]]
+        p_bai_short = self._bai_trans_short[prev_draw[0]][digits[0]]
+        p_shi_short = self._shi_trans_short[prev_draw[1]][digits[1]]
+        p_ge_short = self._ge_trans_short[prev_draw[2]][digits[2]]
+        blend_bai = p_bai_short * 0.4 + p_bai_full * 0.6
+        blend_shi = p_shi_short * 0.4 + p_shi_full * 0.6
+        blend_ge = p_ge_short * 0.4 + p_ge_full * 0.6
+        return blend_bai * blend_shi * blend_ge * 1000
 
     def _group_consensus_score(self, digits: List[int], combined_vals: List[float]) -> float:
         """
@@ -1265,6 +1286,9 @@ class Pick3FusionComplete:
     def _generate_compound(self, top_scored: List[Dict]) -> Dict[str, Any]:
         """基于Top N的三层评分结果生成立体复式
         V2.8.1: 每个位置候选数≥3(不足时展宽到Top 50+), 防止十位单点炸穿
+        V2.10.0:
+          [1] 短间隔重号补偿: 近5期各位置已出数字如不在池中则补入
+          [2] 双通道对齐: 组选复式数字在直选某位置缺失时,自动补入该位置
         """
         compound = {}
 
@@ -1304,6 +1328,19 @@ class Pick3FusionComplete:
         shi_pool = _ensure_min3(list(shi_pool), shi_cnt)
         ge_pool = _ensure_min3(list(ge_pool), ge_cnt)
 
+        # 【P3-短间隔重号补偿】近5期各位置已出数字若不在池中,追加到尾端
+        # 确保短期重复数字不会被评分漏掉
+        if hasattr(self, '_recent_5_positions'):
+            pos_pools = [bai_pool, shi_pool, ge_pool]
+            for pos_idx in range(3):
+                for d in self._recent_5_positions[pos_idx]:
+                    if d is not None and d not in pos_pools[pos_idx]:
+                        pos_pools[pos_idx].append(d)
+            # 限额: 每位置最多保留10个数字
+            for pos_idx in range(3):
+                if len(pos_pools[pos_idx]) > 10:
+                    pos_pools[pos_idx] = pos_pools[pos_idx][:10]
+
         compound['直选复式'] = {
             'bai': sorted(bai_pool),
             'shi': sorted(shi_pool),
@@ -1322,6 +1359,31 @@ class Pick3FusionComplete:
                 'numbers': sorted(pool),
                 'count': len(pool),
                 'desc': f"从{len(pool)}个数字中选3个的组合",
+            }
+            # 【P3-双通道对齐】组选复式数字每个最多补入1个位置, 避免3×8=24次膨胀
+            all_pos = [('bai', bai_pool), ('shi', shi_pool), ('ge', ge_pool)]
+            for d in pool:
+                missing_in = [pname for pname, ppool in all_pos if d not in ppool]
+                if not missing_in:
+                    continue
+                # 补入当前池最小的位置
+                target = min(missing_in, key=lambda pn: len(dict(all_pos)[pn]))
+                if target == 'bai':
+                    bai_pool.append(d)
+                elif target == 'shi':
+                    shi_pool.append(d)
+                else:
+                    ge_pool.append(d)
+            # 限额: 补入后每位置最多10个
+            bai_pool = sorted(set(bai_pool))[:10]
+            shi_pool = sorted(set(shi_pool))[:10]
+            ge_pool = sorted(set(ge_pool))[:10]
+            compound['直选复式'] = {
+                'bai': bai_pool,
+                'shi': shi_pool,
+                'ge': ge_pool,
+                'bets': f"{len(bai_pool)}×{len(shi_pool)}×{len(ge_pool)}="
+                        f"{len(bai_pool)*len(shi_pool)*len(ge_pool)}注",
             }
 
         return compound

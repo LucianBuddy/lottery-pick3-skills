@@ -5,7 +5,7 @@
 所有其他模块通过 from version import VERSION, RELEASE_DATE 引用。
 """
 
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 RELEASE_DATE = "2026-06-29"
 
 # 变更日志
